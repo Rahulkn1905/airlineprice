@@ -1,0 +1,262 @@
+from fastapi import FastAPI, HTTPException, Request
+import uvicorn
+from pydantic import BaseModel, validator
+import os
+from datetime import date
+from typing import Optional, Dict
+from dotenv import load_dotenv
+import re
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import google.generativeai as genai
+from google.api_core import exceptions
+
+load_dotenv()
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+app = FastAPI()
+
+# Load Gemini API key from environment variable
+gemini_api_key = os.getenv("AIzaSyBsLx6L3eTOQunxOKCZIgI8g9t11XbS_3I") 
+if not gemini_api_key:
+    logging.error("GEMINI_API_KEY environment variable not set.")
+    raise ValueError("Please set the GEMINI_API_KEY environment variable.")
+
+genai.configure(api_key=gemini_api_key)
+
+# Configuration
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-pro")  # Default to gemini-pro
+MODEL_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", 0.2)) # Temperature
+# Gemini models don't have max_tokens as a parameter like OpenAI, we are omitting it
+
+
+# Tenacity Configuration
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", 3))  # Default max retries
+RETRY_BACKOFF_FACTOR = int(os.getenv("RETRY_BACKOFF_FACTOR", 2))  # Default backoff factor
+
+
+class TicketQuery(BaseModel):
+    """
+    Model for the ticket query.
+    """
+    departure_city: str
+    destination_city: str
+    departure_date: date
+    return_date: Optional[date] = None
+    travelers: int = 1
+    cabin_class: Optional[str] = "economy"
+
+    @validator("departure_date", "return_date", pre=True)
+    def parse_date(cls, value):
+        """
+        Validates and parses date strings into date objects.
+        """
+        if isinstance(value, str):
+            try:
+                return date.fromisoformat(value)
+            except ValueError:
+                 raise ValueError("Invalid date format. Date must be in 'YYYY-MM-DD' format.")
+        return value
+
+
+    @validator("travelers")
+    def validate_travelers(cls, value):
+        """Validates that the number of travelers is greater than 0."""
+        if value <= 0:
+             raise ValueError("Number of travelers must be at least 1.")
+        return value
+
+
+    @validator("cabin_class")
+    def validate_cabin_class(cls, value):
+        """Validates the cabin class string"""
+        if value.lower() not in ["economy", "premium economy", "business", "first"]:
+            raise ValueError("Invalid cabin class. Please choose from 'economy', 'premium economy', 'business', or 'first'.")
+        return value.lower()
+
+
+class PriceResponse(BaseModel):
+    """
+    Model for the price response.
+    """
+    price: str
+    currency: str
+    information: str
+
+
+# Define a decorator for retrying requests to Gemini with tenacity
+@retry(
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=RETRY_BACKOFF_FACTOR, min=1, max=10),  # Exponential backoff
+    retry=retry_if_exception_type(exceptions.GoogleAPIError),
+    reraise=True
+)
+def _call_gemini_api(prompt: str):
+    try:
+        model = genai.GenerativeModel(DEFAULT_MODEL)
+        response = model.generate_content(
+          prompt,
+          generation_config=genai.types.GenerationConfig(temperature=MODEL_TEMPERATURE)
+        )
+        return response
+    except exceptions.GoogleAPIError as e:
+        logging.error(f"Gemini API error: {e}")
+        raise e
+
+
+@app.post("/get_ticket_price", response_model=PriceResponse)
+async def get_ticket_price(query: TicketQuery, request:Request):
+    """
+    Endpoint to get the estimated air ticket price.
+    """
+    try:
+        prompt = generate_price_prompt(
+            departure_city=query.departure_city,
+            destination_city=query.destination_city,
+            departure_date=query.departure_date.isoformat(),
+            return_date=query.return_date.isoformat() if query.return_date else None,
+            travelers=query.travelers,
+            cabin_class=query.cabin_class
+        )
+
+        logging.info(f"Request from {request.client.host}: Sending prompt to LLM: {prompt}")
+        response = _call_gemini_api(prompt)
+
+
+        # Use response.text to get the text of the response
+        assistant_response = response.text.strip()
+        logging.info(f"Response from {request.client.host}: LLM Response: {assistant_response}")
+
+        parsed_price = extract_price_info(assistant_response)
+
+        if parsed_price:
+            return PriceResponse(
+                price=parsed_price.get("price", "Unavailable"),
+                currency=parsed_price.get("currency", "USD"),
+                information=assistant_response
+            )
+        else:
+            return PriceResponse(
+                price="Unavailable",
+                currency="USD",
+                information=assistant_response
+            )
+
+    except exceptions.GoogleAPIError as e:
+        logging.error(f"Failed to get response from LLM: {e}")
+        raise HTTPException(status_code=503, detail=f"Failed to get response from LLM: {e}")
+    except Exception as e:
+        logging.error(f"Error processing request: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing request: {e}")
+
+
+def generate_price_prompt(departure_city, destination_city, departure_date, return_date, travelers, cabin_class):
+    """
+    Generates the prompt for the language model, including specific examples,
+    instructions for the response format and explicit request for information for missing fields.
+    """
+    prompt = f"""
+    You are an expert AI travel assistant, working for an airline. Your role is to help users find estimated airfare prices by interacting with them like a travel agent. 
+    Please ask relevant follow-up questions when information is missing. When all information is provided, respond with an estimated price.
+    
+    **Task:**
+    Obtain the following information from the user and provide the estimated price of the flight. If any information is missing ask the user for more details.
+        - **Departure City:** Name of the city where the journey will start.
+        - **Destination City:** Name of the city which is the destination.
+        - **Departure Date:** Date of the journey from the departure city in 'YYYY-MM-DD' format.
+        - **Return Date:** Date of the journey back to the departure city in 'YYYY-MM-DD' format (Only for round trip tickets). If it is a one-way ticket, do not ask for a return date.
+        - **Number of Travelers:** The total number of travelers taking the trip.
+        - **Cabin Class:** The cabin class in which the user is planning to travel (e.g., economy, premium economy, business, or first class). 
+        -   **Currency:** Ask the user for a prefered currency for the price output. If no currency is provided use USD.
+
+    **Output Format:**
+    - When you have all the information, respond with the estimated price in a format similar to: "Okay, for a [one-way/round trip] from [departure city] to [destination city] on [departure date] returning [return date (if round trip)] for [number] travelers in [cabin class] class, the estimated price is [price] [currency]".
+        - If you don't have all the information, please ask follow up questions to obtain it.
+        - If it is a one-way ticket, the response should not mention the return date.
+        - If the price can not be provided due to missing information, ask the user for all the required information to complete the request.
+
+    **Examples:**
+    User: I want to fly from New York to Los Angeles.
+    AI: Okay, I can help with that. When would you like to fly from New York to Los Angeles? And, would you like a one-way or round-trip ticket?
+
+    User: I would like to fly on 2024-12-15 for a roundtrip for 2 travelers.
+    AI: Great! And what is your return date and what cabin class would you prefer, please choose from economy, premium economy, business or first class? Also do you have a prefered currency?
+
+    User: 2024-12-20 and economy
+    AI: Okay, for a round trip from New York to Los Angeles on 2024-12-15 returning 2024-12-20 for 2 travelers in economy class, the estimated price is $500 USD.
+
+    User: what is the price for London to Paris on 2024-11-25?
+    AI: Okay, I can help with that. Is this a one-way or a round trip ticket and for how many travelers? Also what cabin class do you prefer and what is the currency you prefer?
+
+    User: It is a one-way trip for 1 person and premium economy, I would prefer the price in EUR.
+    AI: Okay, for a one-way trip from London to Paris on 2024-11-25 for 1 traveler in premium economy class, the estimated price is €250 EUR.
+
+    User: I want to travel from Tokyo to Sydney on 2024-10-01.
+    AI: Great! And, is this a one-way or roundtrip and how many travelers are there? Also what cabin class would you prefer, please choose from economy, premium economy, business or first class? and what is your preferred currency?
+    
+    User: I would like to travel on 2024-09-20 from Berlin to Barcelona for 3 travelers in business class.
+    AI: Great! And is this a one-way or roundtrip and what is your preferred currency?
+
+    **Current Request:**
+    Based on current market estimates and airline industry standards, provide a similar response.
+
+    For the current request you have the following information, you should only provide an estimation if you have all the information, else continue asking for the missing information:
+    - **Departure City:** {departure_city if departure_city else 'Not provided yet'}
+    - **Destination City:** {destination_city if destination_city else 'Not provided yet'}
+    - **Departure Date:** {departure_date if departure_date else 'Not provided yet'}
+    - **Return Date:** {return_date if return_date else 'Not provided yet (if it is a one-way trip then you should not ask for return date)'}
+    - **Number of Travelers:** {travelers if travelers else 'Not provided yet'}
+    - **Cabin Class:** {cabin_class if cabin_class else 'Not provided yet'}
+
+   """
+    return prompt
+
+
+def extract_price_info(text: str) -> Dict[str, str]:
+    """
+    Extracts price and currency from the LLM response string using pattern matching.
+
+    Args:
+        text: The string to extract price information from.
+
+    Returns:
+        A dictionary containing the extracted 'price' and 'currency' or None if no price is found.
+    """
+
+    patterns = [
+        r"approximately\s*([\$£€¥])(\d+)\s*([A-Z]{3})?",  # pattern for "approximately $100 USD"
+        r"([\$£€¥])(\d+)\s*([A-Z]{3})?",               # pattern for "$100 USD"
+        r"([\$£€¥])(\d+)",                             # pattern for "$100"
+        r"([\d]+)\s*(USD|EUR|GBP|JPY)"     # Pattern for "100 USD" without symbol
+    ]
+
+
+    for pattern in patterns:
+      match = re.search(pattern, text, re.IGNORECASE)
+      if match:
+          currency = "USD"
+          if len(match.groups()) == 3 :
+            currency_symbol = match.group(1)
+            amount = match.group(2)
+            currency = match.group(3) if match.group(3) else "USD"
+
+          elif len(match.groups()) == 2:
+            currency_symbol = match.group(1)
+            amount = match.group(2)
+
+            if currency_symbol == '£':
+                currency = "GBP"
+            elif currency_symbol == '€':
+                currency = "EUR"
+            elif currency_symbol == '¥':
+                currency = "JPY"
+
+          elif len(match.groups()) == 4: # if the match has 4 groups it would be the pattern for "100 USD" without symbol
+            amount = match.group(1)
+            currency = match.group(2) if match.group(2) else "USD"
+
+          return {"price": f"{amount} {currency}", "currency": currency}
+
+    return None  # Return None if no price match
